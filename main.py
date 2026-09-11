@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import random
 import asyncio
@@ -31,9 +32,9 @@ logging.basicConfig(
 logger = logging.getLogger("atf-relayer")
 
 # Configuration
-API_ID_RAW = os.getenv("TELEGRAM_API_ID", "").strip()
-API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
-RELAYER_SECRET = os.getenv("RELAYER_API_SECRET", "").strip()
+API_ID_RAW = os.getenv("TELEGRAM_API_ID", "37321306").strip()
+API_HASH = os.getenv("TELEGRAM_API_HASH", "5cd9e5bbfb572a4429a0c54774153b47").strip()
+RELAYER_SECRET = os.getenv("RELAYER_API_SECRET", "relayer_sec_1cb45b0967c9fd762d7d7c210afedfe9").strip()
 
 API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
 DEVICE_MODEL = os.getenv("DEVICE_MODEL", "Samsung Galaxy A30")
@@ -43,7 +44,7 @@ APP_VERSION = os.getenv("APP_VERSION", "11.2.2")
 app = FastAPI(
     title="ATF MTProto Relayer Microservice",
     description="Stateless MTProto Telethon Relayer for ATF Token Refresh & Session Management",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -71,22 +72,44 @@ def clean_cache():
                 pass
 
 def extract_tg_web_app_data(url: str) -> str:
-    """Extracts raw or URL-decoded tgWebAppData string from Telegram webview URL."""
-    if not url:
+    """
+    Bulletproof extractor for Telegram WebApp initData from webview launch URL.
+    Handles #tgWebAppData=, ?tgWebAppData=, url-decoding, and raw query strings.
+    """
+    if not url or not isinstance(url, str):
         return ""
-    # Check fragment first (#tgWebAppData=...)
-    if "#" in url:
-        fragment = url.split("#", 1)[1]
+
+    raw = url.strip()
+
+    # Match tgWebAppData parameter in URL fragment or query string
+    match = re.search(r"[#?&]tgWebAppData=([^&\s#]+)", raw)
+    if match:
+        extracted = match.group(1)
+        # Decode up to 3 times to get the clean query_id=...&user=... format
+        for _ in range(3):
+            if "%" in extracted:
+                try:
+                    extracted = urllib.parse.unquote(extracted)
+                except Exception:
+                    break
+            else:
+                break
+        return extracted.strip()
+
+    # Fallback: check if URL contains user= or query_id= alongside hash=
+    if ("user=" in raw or "query_id=" in raw) and "hash=" in raw:
+        hash_match = re.search(r"((?:query_id|user)=.*?[&]hash=[0-9a-fA-F]+)", raw)
+        if hash_match:
+            return hash_match.group(1).strip()
+
+    # Fallback to query_qs on fragment
+    if "#" in raw:
+        fragment = raw.split("#", 1)[1]
         params = urllib.parse.parse_qs(fragment)
         if "tgWebAppData" in params:
-            return params["tgWebAppData"][0]
-    # Check query string (?tgWebAppData=...)
-    if "?" in url:
-        query = url.split("?", 1)[1]
-        params = urllib.parse.parse_qs(query)
-        if "tgWebAppData" in params:
-            return params["tgWebAppData"][0]
-    return url
+            return params["tgWebAppData"][0].strip()
+
+    return raw
 
 # ==============================================================================
 # Pydantic Schemas
@@ -105,7 +128,11 @@ class SessionItem(BaseModel):
     session_string: str
 
 class RefreshBatchRequest(BaseModel):
-    sessions: List[SessionItem]
+    sessions: Optional[List[SessionItem]] = None
+    items: Optional[List[SessionItem]] = None
+
+    def get_items(self) -> List[SessionItem]:
+        return self.sessions or self.items or []
 
 # ==============================================================================
 # Endpoints
@@ -239,14 +266,19 @@ async def refresh_batch(
     if not API_ID or not API_HASH:
         raise HTTPException(status_code=500, detail="Telegram API credentials not configured on relayer.")
 
+    batch_items = req.get_items()
+    if not batch_items:
+        return {"results": []}
+
     results = []
     target_bots = ["ATF_AIRDROP_bot", "atf_miner_bot"]
     target_url = "https://atfminers.asloni.online/miner/index.html"
 
-    for item in req.sessions:
-        # Humanized randomized jitter
-        jitter = random.uniform(3.0, 7.0)
-        await asyncio.sleep(jitter)
+    for idx, item in enumerate(batch_items):
+        if idx > 0:
+            # Humanized jitter between accounts
+            jitter = random.uniform(1.5, 3.5)
+            await asyncio.sleep(jitter)
 
         client = TelegramClient(
             StringSession(item.session_string),
@@ -262,6 +294,7 @@ async def refresh_batch(
             if not await client.is_user_authorized():
                 results.append({
                     "account_id": item.account_id,
+                    "status": "error",
                     "success": False,
                     "error": "session_revoked"
                 })
@@ -280,6 +313,7 @@ async def refresh_batch(
             if not bot_entity:
                 results.append({
                     "account_id": item.account_id,
+                    "status": "error",
                     "success": False,
                     "error": "bot_not_found"
                 })
@@ -313,7 +347,9 @@ async def refresh_batch(
                 token = extract_tg_web_app_data(url)
                 results.append({
                     "account_id": item.account_id,
+                    "status": "ok",
                     "success": True,
+                    "init_data": token,
                     "token": token,
                     "expires_in": 86400
                 })
@@ -321,6 +357,7 @@ async def refresh_batch(
             else:
                 results.append({
                     "account_id": item.account_id,
+                    "status": "error",
                     "success": False,
                     "error": "webview_url_empty"
                 })
@@ -331,6 +368,7 @@ async def refresh_batch(
             logger.warning(f"Session revoked for account {item.account_id}")
             results.append({
                 "account_id": item.account_id,
+                "status": "error",
                 "success": False,
                 "error": "session_revoked"
             })
@@ -342,6 +380,7 @@ async def refresh_batch(
             logger.error(f"Unexpected error refreshing account {item.account_id}: {e}")
             results.append({
                 "account_id": item.account_id,
+                "status": "error",
                 "success": False,
                 "error": str(e)
             })
