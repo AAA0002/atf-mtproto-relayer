@@ -224,15 +224,15 @@ async def verify_code(req: VerifyCodeRequest):
             app_version=APP_VERSION
         )
         await client.connect()
-
     try:
-        try:
-            await client.sign_in(phone=phone, code=req.code, phone_code_hash=req.phone_code_hash)
-        except SessionPasswordNeededError:
-            if req.password:
+        if req.password:
+            try:
                 await client.sign_in(password=req.password)
-            else:
-                return {"status": "2fa_required", "message": "Telegram Cloud 2FA password required"}
+            except Exception:
+                await client.sign_in(phone=phone, code=req.code, phone_code_hash=req.phone_code_hash)
+                await client.sign_in(password=req.password)
+        else:
+            await client.sign_in(phone=phone, code=req.code, phone_code_hash=req.phone_code_hash)
 
         session_str = client.session.save()
         CLIENT_CACHE.pop(phone, None)
