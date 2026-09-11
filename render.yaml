@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: atf-mtproto-relayer
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: RELAYER_API_SECRET
+        generateValue: true
