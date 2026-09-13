@@ -138,8 +138,10 @@ class RefreshBatchRequest(BaseModel):
 # Endpoints
 # ==============================================================================
 
+@app.get("/health")
 @app.get("/healthz")
 @app.get("/wake")
+@app.get("/")
 async def wake():
     """Two-step cold-boot wakeup and liveness probe."""
     return {"status": "ready", "timestamp": int(time.time()), "relayer": "atf-mtproto-relayer"}
